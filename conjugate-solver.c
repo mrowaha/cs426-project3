@@ -23,6 +23,10 @@
 #define malloc_n_by_p_vector(n, p) ((double *)malloc(((n) / (p)) * sizeof(double)))
 #define malloc_n_by_sqrtp_vector(n, p) ((double *)malloc(((n) / ((int)sqrt(p))) * sizeof(double)))
 
+typedef enum {
+    TAG_send_x_result = 5,
+} TAGS;
+
 double* expand_vector_within_columns(
     MPI_Comm comm,
     const int alpha,
@@ -160,12 +164,7 @@ int main(int argc, char** argv) {
             free(y);
         }
 
-
-        char file[100];
-        snprintf(file, 100, "x_(%d,%d).txt", alpha, beta);
-        write_vector_to_file(x, n_by_p, file);
-
-        MPI_Barrier(CONJUGATE_SOLVER_COMM);
+        MPI_Send(x, n_by_p, MPI_DOUBLE, MASTER, TAG_send_x_result, MPI_COMM_WORLD);
         free(A_block);
         free(b);
         free(r_vec);
@@ -209,11 +208,22 @@ int main(int argc, char** argv) {
             }
         }
 
-
+        // result accumulation
+        double* x = malloc(n * sizeof(double));
+        memset(x, 0, n * sizeof(double));
+        for (int beta = 0; beta < sqrt_p; ++beta) {
+            for (int alpha = 0; alpha < sqrt_p; ++alpha) {
+                double *offset = x + (beta * n_by_sqrtp) + (alpha * n_by_p);
+                int src = 1 + alpha * sqrt_p + beta;
+                MPI_Recv(offset, n_by_p, MPI_DOUBLE, src, TAG_send_x_result, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+        write_vector_to_file(x, n, "result.txt");
         free(b);
         free(A);
+        free(x);
     }
-
+    MPI_Comm_free(&CONJUGATE_SOLVER_COMM);
     MPI_Finalize();
     return EXIT_SUCCESS;
 }

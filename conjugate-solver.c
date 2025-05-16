@@ -102,18 +102,21 @@ int main(int argc, char** argv) {
 
         // expand p_vec within columns to form pv
         int pv_size;
-        double *pv = expand_vector_within_columns(CONJUGATE_SOLVER_COMM, alpha, beta, p_vec, n, p, &pv_size);
-        if (pv_size != n_by_sqrtp) {
-            fprintf(stderr, "conjugate solver rank %d: final pv size was expected to be n / sqrt(p) = %d but got %d\n", worker_comm_rank, n_by_sqrtp, pv_size);
-            MPI_Abort(CONJUGATE_SOLVER_COMM, 1);
-        }
+        double *pv;
 
         for (int iter = 0; iter < MAX_ITER; iter++) {
             if (rho < TOL) {
                 printf("%d: rho TOL reached\n", worker_comm_rank);
                 break; // if the global rho has reached TOL, all processes break
             }
-            double *z = malloc_n_by_sqrtp_vector(n ,p);
+
+            pv = expand_vector_within_columns(CONJUGATE_SOLVER_COMM, alpha, beta, p_vec, n, p, &pv_size);
+            if (pv_size != n_by_sqrtp) {
+                fprintf(stderr, "conjugate solver rank %d: final pv size was expected to be n / sqrt(p) = %d but got %d\n", worker_comm_rank, n_by_sqrtp, pv_size);
+                MPI_Abort(CONJUGATE_SOLVER_COMM, 1);
+            }
+
+            double *z = malloc_n_by_sqrtp_vector(n, p);
             int z_size = n_by_sqrtp;
             matrix_vector_multiply(A_block, pv, z, n_by_sqrtp, n_by_sqrtp);
             fold_z_within_rows(CONJUGATE_SOLVER_COMM, coords, n, p, &z, &z_size);
@@ -141,29 +144,18 @@ int main(int argc, char** argv) {
             double gamma = 0;
             MPI_Allreduce(&_gamma, &gamma, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
 
-            double _phi = dot(y, r_vec, n_by_p);
-            double phi = 0;
-            MPI_Allreduce(&_phi, &phi, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
-
             double _psi = dot(y, y, n_by_p);
             double psi = 0;
             MPI_Allreduce(&_psi, &psi, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
 
             double a = rho / gamma;
-            double rho_not = rho - a*phi + (a * a) * psi;
-            double B = rho_not / rho;
-            rho = rho_not;
+            double B = a * ( psi / gamma ) - 1;
+            rho = B * rho;
             
             add_scaled_vector_to(x, a, p_vec, n_by_p);
-            add_scaled_vector_to(r_vec, a, y, n_by_p);
+            subtract_scaled_vector_from(r_vec, a, y, n_by_p);
             for (int i = 0; i < n_by_p; i++) {
                 p_vec[i] = r_vec[i] + B * p_vec[i];
-            }
-
-            pv = expand_vector_within_columns(CONJUGATE_SOLVER_COMM, alpha, beta, p_vec, n, p, &pv_size);
-            if (pv_size != n_by_sqrtp) {
-                fprintf(stderr, "conjugate solver rank %d: final pv size was expected to be n / sqrt(p) = %d but got %d\n", worker_comm_rank, n_by_sqrtp, pv_size);
-                MPI_Abort(CONJUGATE_SOLVER_COMM, 1);
             }
             free(y);
         }

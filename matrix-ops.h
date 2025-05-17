@@ -83,4 +83,24 @@ void write_vector_to_file(double* vec, int size, char* filename) {
     fclose(f);
 }
 
+void write_matrix_to_file(double* matrix, int n, const char* filename) {
+    FILE* f = fopen(filename, "w");
+    if (f == NULL) {
+        perror("Error opening file");
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            fprintf(f, "%.6f", matrix[i * n + j]);
+            if (j < n - 1) {
+                fprintf(f, " ");
+            }
+        }
+        fprintf(f, "\n");
+    }
+
+    fclose(f);
+}
+
 #endif // _MATRIX_OPS_H

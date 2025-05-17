@@ -37,14 +37,43 @@ double* expand_vector_within_columns(
     int* _pv_size  
 );
 
-void fold_z_within_rows(
-    MPI_Comm comm,
-    const int* coords,
-    const int n,
-    const int p,
-    double** z,
-    int* z_size
-);
+// void fold_z_within_rows(
+//     MPI_Comm comm,
+//     const int* coords,
+//     const int n,
+//     const int p,
+//     double** z,
+//     int* z_size
+// );
+
+
+void fold_z_within_rows(MPI_Comm   row_comm,
+                        const int *coords,      /* [α, β]                        */
+                        const int  n,
+                        const int  p,
+                        double   **z,
+                        int       *z_size);
+
+/* collective reduction inside a processor row --------------------------------*/
+// static void fold_z_within_rows(MPI_Comm row_comm,
+//                                double   *z_local,
+//                                int       n_by_sqrtp,
+//                                int       n_by_p)
+// {
+//     /* Every worker keeps exactly n/p doubles after the reduction */
+//     double *tmp = (double *)malloc(n_by_p * sizeof(double));
+
+//     MPI_Reduce_scatter_block( z_local,       /* sendbuf                      */
+//                               tmp,           /* recvbuf                      */
+//                               n_by_p,        /* recvcount per proc           */
+//                               MPI_DOUBLE,    /* type                         */
+//                               MPI_SUM,       /* operation                    */
+//                               row_comm );    /* communicator (same α)        */
+
+//     /* copy back into the user buffer and shrink the logical length */
+//     memcpy(z_local, tmp, n_by_p * sizeof(double));
+//     free(tmp);
+// }
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
@@ -83,11 +112,18 @@ int main(int argc, char** argv) {
         coords[1] = worker_comm_rank % sqrt_p;
         const int alpha = coords[0];
         const int beta = coords[1];
+        const int transpose_partner = beta * sqrt_p + alpha;  // (β, α)
+
+        MPI_Comm row_comm, col_comm;
+
+        MPI_Comm_split(CONJUGATE_SOLVER_COMM, /*color =*/coords[0], coords[1], &row_comm);
+        MPI_Comm_split(CONJUGATE_SOLVER_COMM, /*color =*/coords[1], coords[0], &col_comm);
 
         const int n_by_sqrtp = n / sqrt_p;
         const int n_by_p = n / p;
         double *A_block = malloc(n_by_sqrtp * n_by_sqrtp * sizeof(double));
         MPI_Recv(A_block, n_by_sqrtp * n_by_sqrtp, MPI_DOUBLE, MASTER, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
 
         double *b = malloc_n_by_p_vector(n, p);
         MPI_Recv(b, n_by_p, MPI_DOUBLE, MASTER, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -101,16 +137,13 @@ int main(int argc, char** argv) {
         memcpy(p_vec, b, n_by_p * sizeof(double));
 
         double _rho = dot(r_vec, r_vec, n_by_p);
-        double rho = 0;
+        double rho = 0, pi = 0, kappa = 0;
         MPI_Allreduce(&_rho, &rho, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM); // now we have ρ
 
-        // expand p_vec within columns to form pv
         int pv_size;
         double *pv;
-
         for (int iter = 0; iter < MAX_ITER; iter++) {
             if (rho < TOL) {
-                printf("%d: rho TOL reached\n", worker_comm_rank);
                 break; // if the global rho has reached TOL, all processes break
             }
 
@@ -123,15 +156,16 @@ int main(int argc, char** argv) {
             double *z = malloc_n_by_sqrtp_vector(n, p);
             int z_size = n_by_sqrtp;
             matrix_vector_multiply(A_block, pv, z, n_by_sqrtp, n_by_sqrtp);
-            fold_z_within_rows(CONJUGATE_SOLVER_COMM, coords, n, p, &z, &z_size);
-            if (z_size != n_by_p) {
-                fprintf(stderr, "conjugate solver rank %d: final fold z size was expected to be n / p = %d but got %d\n", worker_comm_rank, n_by_p, z_size);
-                MPI_Abort(CONJUGATE_SOLVER_COMM, 1);
-            }
+            fold_z_within_rows(row_comm, coords, n, p, &z, &z_size);
+            // fold_z_within_rows(row_comm, z, n_by_sqrtp, n_by_p);
+            // if (z_size != n_by_p) {
+            //     fprintf(stderr, "conjugate solver rank %d: final fold z size was expected to be n / p = %d but got %d\n", worker_comm_rank, n_by_p, z_size);
+            //     MPI_Abort(CONJUGATE_SOLVER_COMM, 1);
+            // }
             // now z is basically y^{alpha, beta}
 
+
             // perform a transpose
-            int transpose_partner = beta * sqrt_p + alpha;  // (β, α)
             double* y = malloc(z_size * sizeof(double)); // this is now y^{βα}
             if (worker_comm_rank != transpose_partner) {
                 MPI_Sendrecv(
@@ -143,27 +177,40 @@ int main(int argc, char** argv) {
                 memcpy(y, z, z_size * sizeof(double));
             }
             free(z);
-            
-            double _gamma = dot(p_vec, y, n_by_p);
-            double gamma = 0;
-            MPI_Allreduce(&_gamma, &gamma, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
 
-            double _psi = dot(y, y, n_by_p);
-            double psi = 0;
-            MPI_Allreduce(&_psi, &psi, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
+            double pi_k = dot(p_vec, y, n_by_p);
+            double kappa_k = dot(y, y, n_by_p);
+            MPI_Allreduce(&pi_k, &pi, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
+            MPI_Allreduce(&kappa_k, &kappa, 1, MPI_DOUBLE, MPI_SUM, CONJUGATE_SOLVER_COMM);
 
-            double a = rho / gamma;
-            double B = a * ( psi / gamma ) - 1;
-            rho = B * rho;
-            
+
+            double a = rho / pi;
             add_scaled_vector_to(x, a, p_vec, n_by_p);
             subtract_scaled_vector_from(r_vec, a, y, n_by_p);
-            for (int i = 0; i < n_by_p; i++) {
-                p_vec[i] = r_vec[i] + B * p_vec[i];
-            }
+            // double B = a * ( kappa / pi ) - 1;
+            // rho = B * rho;
+            
+            // for (int i = 0; i < n_by_p; i++) {
+            //     p_vec[i] = r_vec[i] + B * p_vec[i];
+            // }
+
+            double _rho_new = dot(r_vec, r_vec, n_by_p);
+            double rho_new;
+            MPI_Allreduce(&_rho_new, &rho_new, 1, MPI_DOUBLE, MPI_SUM,
+                        CONJUGATE_SOLVER_COMM);                  /* ρₖ₊₁ = rᵀ r        */
+
+            double b = rho_new / rho;                           /* βₖ   = ρₖ₊₁ / ρₖ   */
+            rho   = rho_new;                                       /* prepare for next k */
+
+            for (int i = 0; i < n_by_p; ++i)
+                p_vec[i] = r_vec[i] + b * p_vec[i];             /* pₖ₊₁ = rₖ₊₁ + β pₖ */
+
             free(y);
         }
 
+        char f[100];
+        snprintf(f, 100, "P_x(%d,%d).txt", alpha, beta);
+        write_vector_to_file(x, n_by_p, f);
         MPI_Send(x, n_by_p, MPI_DOUBLE, MASTER, TAG_send_x_result, MPI_COMM_WORLD);
         free(A_block);
         free(b);
@@ -171,6 +218,7 @@ int main(int argc, char** argv) {
         free(p_vec);
         free(pv);
         free(x);
+        MPI_Comm_free(&CONJUGATE_SOLVER_COMM);
     }
 
     if (rank == MASTER && CONJUGATE_SOLVER_COMM == MPI_COMM_NULL) {
@@ -202,6 +250,7 @@ int main(int argc, char** argv) {
                 double *offset = b + (beta * n_by_sqrtp) + (alpha * n_by_p);
                 double *_b = malloc(n_by_p * sizeof(double));
                 memcpy(_b, offset, n_by_p * sizeof(double));
+
                 int dest = 1 + alpha * sqrt_p + beta;
                 MPI_Send(_b, n_by_p, MPI_DOUBLE, dest, 2, MPI_COMM_WORLD);
                 free(_b);
@@ -218,12 +267,15 @@ int main(int argc, char** argv) {
                 MPI_Recv(offset, n_by_p, MPI_DOUBLE, src, TAG_send_x_result, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             }
         }
-        write_vector_to_file(x, n, "result.txt");
+        
+
+        char out[100];
+        snprintf(out, 100, "result_%d.txt", size);
+        write_vector_to_file(x, n, out);
         free(b);
         free(A);
         free(x);
     }
-    MPI_Comm_free(&CONJUGATE_SOLVER_COMM);
     MPI_Finalize();
     return EXIT_SUCCESS;
 }
@@ -273,61 +325,156 @@ double* expand_vector_within_columns(
     return pv;
 }
 
-void fold_z_within_rows(
-    MPI_Comm comm,
-    const int* coords,
-    const int n,
-    const int p,
-    double** z,
-    int* z_size
-) {
+/*---------------------------------------------------------------------------
+ * Manual reduce–scatter along a processor-row  (fixed version)
+ *
+ *  –  communicator  : row_comm  (all ranks share the same α, rank == β)
+ *  –  on entry  *z   : n/√p  doubles,   local contribution Aᵅᵝ · pᵝ
+ *               *z_size = n/√p
+ *  –  on exit   *z   : n/p   doubles,   Σᵝ Aᵅᵝ · pᵝ   ( β-th block )
+ *               *z_size = n/p
+ *---------------------------------------------------------------------------*/
+void fold_z_within_rows(MPI_Comm   row_comm,
+                        const int *coords,      /* [α, β]                        */
+                        const int  n,
+                        const int  p,
+                        double   **z,
+                        int       *z_size)
+{
+    const int n_by_p      = n / p;
+    const int sqrt_p      = (int)sqrt(p);         /* # ranks in a row             */
+    const int n_by_sqrtp  = n / sqrt_p;
+    const int log_sqrt_p  = (int)log2(sqrt_p);    /* p is guaranteed power-of-2   */
 
-    // primitives
-    const int n_by_p = n / p;
-    const int sqrt_p = (int)sqrt(p); // p is perfect sqrt in this restriction
-    const int log_sqrt_p = (int)(log2(sqrt_p));  // Number of folding steps
-    const int n_by_sqrtp = n / sqrt_p;
-
-    if (*(z_size) != n_by_sqrtp) {
-        fprintf(stderr, "P(%d, %d): in the fold start phase, size of z must be equal to n / sqrt(p)\n", coords[0], coords[1]);
-        MPI_Abort(comm, EXIT_FAILURE);
+    /* ---------- sanity check ------------------------------------------------*/
+    if (*z_size != n_by_sqrtp) {
+        fprintf(stderr,
+                "P(%d,%d) fold_z_within_rows: z_size (%d) "
+                "must start at n/√p (%d)\n",
+                coords[0], coords[1], *z_size, n_by_sqrtp);
+        MPI_Abort(row_comm, EXIT_FAILURE);
     }
 
+    /* β is the rank inside the *row* communicator --------------------------- */
+    int beta;
+    MPI_Comm_rank(row_comm, &beta);               /* β ≡ coords[1]                */
 
-    int fold_size = *z_size; // fold starts from n / sqrt(p) and goes all the way down to n / p
-    int alpha = coords[0];
-    int beta = coords[1];
-    for (int i = 0; i < log_sqrt_p; i++) {
-        int half_size = fold_size / 2;
-        double* z1 = *z;                  // First half
-        double* z2 = *z + half_size;      // Second half
+    int fold_size = *z_size;                      /* starts at n/√p , halves ...  */
 
-        int bit_mask = 1 << i;
-        int partner_beta = beta ^ bit_mask;    // Flip i-th bit of β
-        int partner_rank = alpha * sqrt_p + partner_beta;
+    for (int i = 0; i < log_sqrt_p; ++i) {
+        const int bit_mask     = 1 << i;
+        const int partner_beta = beta ^ bit_mask; /* rank inside row_comm         */
+        const int half_size    = fold_size >> 1;  /* fold_size / 2                */
 
-        MPI_Status status;
-        double* recv_buf = malloc(half_size * sizeof(double));
-        double* next_zblock = malloc(half_size * sizeof(double));
-        if ((beta & bit_mask) != 0) {
-            // i-th bit is 1: send z1, receive w2, update z2 := z2 + w2
-            MPI_Send(z1, half_size, MPI_DOUBLE, partner_rank, 100 + i, comm);
-            MPI_Recv(recv_buf, half_size, MPI_DOUBLE, partner_rank, 200 + i, comm, &status);
-            for (int j = 0; j < half_size; ++j) {
-                next_zblock[j] = z2[j] + recv_buf[j];
-            }
+        double *z1 = *z;               /* lower half                         */
+        double *z2 = *z + half_size;   /* upper half                         */
+        double *recv_buf = (double *)malloc(half_size * sizeof(double));
+
+        /* --------------------------------------------------------------------
+         * Protocol (tags = i to stay unique):
+         *   β bit i == 0  → keep LOWER half    → send UPPER half
+         *   β bit i == 1  → keep UPPER half    → send LOWER half
+         * ------------------------------------------------------------------ */
+        if ((beta & bit_mask) == 0) {
+            /* keep lower ---------------------------------------------------------------- */
+            MPI_Sendrecv(z2,       half_size, MPI_DOUBLE, partner_beta, i,
+                         recv_buf, half_size, MPI_DOUBLE, partner_beta, i,
+                         row_comm, MPI_STATUS_IGNORE);
+
+            for (int j = 0; j < half_size; ++j)
+                z1[j] += recv_buf[j];
+
+            /* shrink to the half we keep */
+            *z = (double *)realloc(*z, half_size * sizeof(double));
+            /* z1 already points to the new lower half */
         } else {
-            // i-th bit is 0: receive w1, send z2, update z1 := z1 + w1
-            MPI_Recv(recv_buf, half_size, MPI_DOUBLE, partner_rank, 100 + i, comm, &status);
-            MPI_Send(z2, half_size, MPI_DOUBLE, partner_rank, 200 + i, comm);
-            for (int j = 0; j < half_size; ++j) {
-                next_zblock[j] = z1[j] + recv_buf[j];
-            }
+            /* keep upper ---------------------------------------------------------------- */
+            MPI_Sendrecv(z1,       half_size, MPI_DOUBLE, partner_beta, i,
+                         recv_buf, half_size, MPI_DOUBLE, partner_beta, i,
+                         row_comm, MPI_STATUS_IGNORE);
+
+            for (int j = 0; j < half_size; ++j)
+                z2[j] += recv_buf[j];
+
+            /* move kept half to the front, then shrink */
+            memmove(*z, z2, half_size * sizeof(double));
+            *z = (double *)realloc(*z, half_size * sizeof(double));
         }
-        free(*z);
+
         free(recv_buf);
-        *z = next_zblock;
-        fold_size = half_size;
+        fold_size = half_size;         /* prepare for next stage             */
     }
-    *z_size = fold_size;
+
+    *z_size = fold_size;               /* == n/p when we exit the loop       */
 }
+
+
+// void fold_z_within_rows(
+//     MPI_Comm comm,
+//     const int* coords,
+//     const int n,
+//     const int p,
+//     double** z,
+//     int* z_size
+// ) {
+//     // primitives
+//     const int n_by_p = n / p;
+//     const int sqrt_p = (int)sqrt(p); // p is perfect sqrt in this restriction
+//     const int log_sqrt_p = (int)(log2(sqrt_p));  // Number of folding steps
+//     const int n_by_sqrtp = n / sqrt_p;
+
+//     if (*(z_size) != n_by_sqrtp) {
+//         fprintf(stderr, "P(%d, %d): in the fold start phase, size of z must be equal to n / sqrt(p)\n", coords[0], coords[1]);
+//         MPI_Abort(comm, EXIT_FAILURE);
+//     }
+
+//     int fold_size = *z_size; // fold starts from n / sqrt(p) and goes all the way down to n / p
+//     int alpha = coords[0];
+//     int beta = coords[1];
+
+//     for (int i = 0; i < log_sqrt_p; i++) {
+//         int half_size = fold_size / 2;
+//         double* z1 = *z;                  // First half
+//         double* z2 = *z + half_size;      // Second half
+
+//         int bit_mask = 1 << i;
+//         int partner_beta = beta ^ bit_mask;    // Flip i-th bit of β
+//         int partner_rank = alpha * sqrt_p + partner_beta;
+
+//         MPI_Status status;
+//         double* recv_buf = malloc(half_size * sizeof(double));
+        
+//         if ((beta & bit_mask) != 0) {
+//             // i-th bit is 1: send z1, receive w2, update z2 := z2 + w2
+//             MPI_Send(z1, half_size, MPI_DOUBLE, partner_rank, 100 + i, comm);
+//             MPI_Recv(recv_buf, half_size, MPI_DOUBLE, partner_rank, 200 + i, comm, &status);
+            
+//             // We need to keep only one half after each fold iteration
+//             double* next_zblock = malloc(half_size * sizeof(double));
+//             for (int j = 0; j < half_size; ++j) {
+//                 next_zblock[j] = z2[j] + recv_buf[j];
+//             }
+            
+//             free(*z);
+//             *z = next_zblock;
+//         } else {
+//             // i-th bit is 0: receive w1, send z2, update z1 := z1 + w1
+//             MPI_Recv(recv_buf, half_size, MPI_DOUBLE, partner_rank, 100 + i, comm, &status);
+//             MPI_Send(z2, half_size, MPI_DOUBLE, partner_rank, 200 + i, comm);
+
+//             // We need to keep only one half after each fold iteration
+//             double* next_zblock = malloc(half_size * sizeof(double));
+//             for (int j = 0; j < half_size; ++j) {
+//                 next_zblock[j] = z1[j] + recv_buf[j];
+//             }
+            
+//             free(*z);
+//             *z = next_zblock;
+//         }
+        
+//         free(recv_buf);
+//         fold_size = half_size;
+//     }
+    
+//     *z_size = fold_size;
+// }

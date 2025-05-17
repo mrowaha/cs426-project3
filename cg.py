@@ -35,7 +35,7 @@ def main():
 
     x = run_cg(A, b)
 
-    np.savetxt("solution.txt", x)
+    np.savetxt("solution.txt", x, fmt="%.6f")
     print("Solution saved to solution.txt")
 
 if __name__ == "__main__":
